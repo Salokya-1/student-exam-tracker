@@ -1,0 +1,356 @@
+// RTE Hub - integrated data model for Islington College RTE Department
+// Covers: academic records, results workflow, timetabling, examinations,
+// seating, invigilation, faculty workload, rooms, RBAC, audit trail.
+// SQLite via Prisma 6 (enums are stored as String - see src/lib/constants.ts)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------- Identity & RBAC -----------------------------
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  name         String
+  passwordHash String
+  role         String // ADMIN | RTE_STAFF | LECTURER | STUDENT
+  lecturerId   String?   @unique
+  studentId    String?   @unique
+  lecturer     Lecturer? @relation(fields: [lecturerId], references: [id])
+  student      Student?  @relation(fields: [studentId], references: [id])
+  createdAt    DateTime  @default(now())
+  auditLogs    AuditLog[]
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id])
+  action    String // e.g. RESULT_PUBLISHED, SESSION_MOVED
+  entity    String
+  entityId  String?
+  details   String? // JSON
+  createdAt DateTime @default(now())
+
+  @@index([entity, entityId])
+  @@index([createdAt])
+}
+
+// ----------------------------- Academic structure -----------------------------
+model Programme {
+  id      String   @id @default(cuid())
+  code    String   @unique
+  name    String
+  level   String // UG | PG
+  intakes Intake[]
+  modules Module[]
+}
+
+model Intake {
+  id          String    @id @default(cuid())
+  code        String    @unique // e.g. 2024-SEP-BSC-COMP
+  year        Int
+  term        String // SEP | JAN | MAY
+  programmeId String
+  programme   Programme @relation(fields: [programmeId], references: [id])
+  cohorts     Cohort[]
+  students    Student[]
+}
+
+// A cohort is a timetabled student group (e.g. L5CG1)
+model Cohort {
+  id          String               @id @default(cuid())
+  code        String               @unique
+  name        String
+  intakeId    String
+  intake      Intake               @relation(fields: [intakeId], references: [id])
+  semester    Int
+  size        Int                  @default(0)
+  students    Student[]
+  assignments TeachingAssignment[]
+  sessions    TimetableSession[]
+  sheets      ResultSheet[]
+  examCohorts ExamCohort[]
+}
+
+model Student {
+  id           String              @id @default(cuid())
+  studentNo    String              @unique
+  firstName    String
+  lastName     String
+  email        String              @unique
+  intakeId     String
+  intake       Intake              @relation(fields: [intakeId], references: [id])
+  cohortId     String
+  cohort       Cohort              @relation(fields: [cohortId], references: [id])
+  semester     Int                 @default(1)
+  standing     String              @default("GOOD") // GOOD | AT_RISK | PROBATION | WITHDRAWN
+  enrolments   ModuleEnrollment[]
+  seats        SeatAllocation[]
+  user         User?
+  progressions ProgressionRecord[]
+}
+
+model Module {
+  id          String               @id @default(cuid())
+  code        String               @unique
+  name        String
+  credits     Int                  @default(20)
+  level       Int // 4,5,6,7
+  semester    Int // 1 or 2
+  programmeId String
+  programme   Programme            @relation(fields: [programmeId], references: [id])
+  requiresLab Boolean              @default(false)
+  assessments Assessment[]
+  enrolments  ModuleEnrollment[]
+  assignments TeachingAssignment[]
+  sessions    TimetableSession[]
+  sheets      ResultSheet[]
+  exams       ExamSession[]
+}
+
+model Assessment {
+  id       String @id @default(cuid())
+  moduleId String
+  module   Module @relation(fields: [moduleId], references: [id])
+  name     String // Coursework | Exam | Practical
+  weight   Int // percent
+  maxMarks Int    @default(100)
+  marks    Mark[]
+}
+
+model ModuleEnrollment {
+  id        String  @id @default(cuid())
+  studentId String
+  student   Student @relation(fields: [studentId], references: [id])
+  moduleId  String
+  module    Module  @relation(fields: [moduleId], references: [id])
+  term      String // e.g. 2025-SEP
+  attempt   Int     @default(1)
+  status    String  @default("ACTIVE") // ACTIVE | PASSED | FAILED | RESIT
+  marks     Mark[]
+  resits    Resit[]
+
+  @@unique([studentId, moduleId, attempt])
+  @@index([moduleId, term])
+}
+
+// ----------------------------- Results workflow -----------------------------
+model ResultSheet {
+  id          String    @id @default(cuid())
+  moduleId    String
+  module      Module    @relation(fields: [moduleId], references: [id])
+  cohortId    String
+  cohort      Cohort    @relation(fields: [cohortId], references: [id])
+  term        String
+  status      String    @default("DRAFT") // DRAFT | SUBMITTED | APPROVED | PUBLISHED
+  submittedBy String?
+  submittedAt DateTime?
+  approvedBy  String?
+  approvedAt  DateTime?
+  publishedAt DateTime?
+  note        String?
+  marks       Mark[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([moduleId, cohortId, term])
+}
+
+model Mark {
+  id           String           @id @default(cuid())
+  sheetId      String
+  sheet        ResultSheet      @relation(fields: [sheetId], references: [id], onDelete: Cascade)
+  enrollmentId String
+  enrollment   ModuleEnrollment @relation(fields: [enrollmentId], references: [id])
+  assessmentId String
+  assessment   Assessment       @relation(fields: [assessmentId], references: [id])
+  marks        Float?
+  updatedAt    DateTime         @updatedAt
+
+  @@unique([sheetId, enrollmentId, assessmentId])
+}
+
+model Resit {
+  id           String           @id @default(cuid())
+  enrollmentId String
+  enrollment   ModuleEnrollment @relation(fields: [enrollmentId], references: [id])
+  reason       String
+  term         String
+  outcome      String           @default("PENDING") // PENDING | PASSED | FAILED
+  createdAt    DateTime         @default(now())
+}
+
+model ProgressionRecord {
+  id        String   @id @default(cuid())
+  studentId String
+  student   Student  @relation(fields: [studentId], references: [id])
+  term      String
+  decision  String // PROGRESS | PROGRESS_WITH_RESIT | REPEAT | REVIEW
+  average   Float
+  credits   Int
+  note      String?
+  createdAt DateTime @default(now())
+}
+
+// ----------------------------- Faculty, rooms, time -----------------------------
+model Lecturer {
+  id              String               @id @default(cuid())
+  staffNo         String               @unique
+  name            String
+  email           String               @unique
+  department      String
+  maxHoursPerWeek Int                  @default(16)
+  assignments     TeachingAssignment[]
+  sessions        TimetableSession[]
+  invigilations   Invigilation[]
+  user            User?
+}
+
+model Room {
+  id            String             @id @default(cuid())
+  code          String             @unique
+  name          String
+  building      String
+  capacity      Int
+  type          String // LECTURE | LAB | SEMINAR | HALL
+  equipment     String // JSON array of strings
+  rows          Int                @default(6)
+  cols          Int                @default(8)
+  active        Boolean            @default(true)
+  sessions      TimetableSession[]
+  examVenues    ExamVenue[]
+  seats         SeatAllocation[]
+  invigilations Invigilation[]
+}
+
+model TimeSlot {
+  id       String             @id @default(cuid())
+  day      Int // 0=Sun ... 6=Sat  (Islington runs Sun-Fri)
+  startMin Int // minutes from midnight
+  endMin   Int
+  label    String
+  sessions TimetableSession[]
+
+  @@unique([day, startMin])
+}
+
+// Demand: what must be timetabled for a cohort
+model TeachingAssignment {
+  id           String   @id @default(cuid())
+  moduleId     String
+  module       Module   @relation(fields: [moduleId], references: [id])
+  cohortId     String
+  cohort       Cohort   @relation(fields: [cohortId], references: [id])
+  lecturerId   String
+  lecturer     Lecturer @relation(fields: [lecturerId], references: [id])
+  sessionType  String // LECTURE | TUTORIAL | LAB
+  hoursPerWeek Int      @default(1)
+  term         String
+
+  @@unique([moduleId, cohortId, sessionType, term])
+}
+
+model Timetable {
+  id        String             @id @default(cuid())
+  name      String
+  term      String
+  status    String             @default("DRAFT") // DRAFT | PUBLISHED | ARCHIVED
+  generated Boolean            @default(false)
+  score     Float?
+  createdAt DateTime           @default(now())
+  sessions  TimetableSession[]
+}
+
+model TimetableSession {
+  id          String    @id @default(cuid())
+  timetableId String
+  timetable   Timetable @relation(fields: [timetableId], references: [id], onDelete: Cascade)
+  moduleId    String
+  module      Module    @relation(fields: [moduleId], references: [id])
+  cohortId    String
+  cohort      Cohort    @relation(fields: [cohortId], references: [id])
+  lecturerId  String
+  lecturer    Lecturer  @relation(fields: [lecturerId], references: [id])
+  roomId      String
+  room        Room      @relation(fields: [roomId], references: [id])
+  slotId      String
+  slot        TimeSlot  @relation(fields: [slotId], references: [id])
+  sessionType String
+  locked      Boolean   @default(false)
+
+  @@index([timetableId, slotId])
+}
+
+// ----------------------------- Examinations -----------------------------
+model ExamSession {
+  id            String           @id @default(cuid())
+  moduleId      String
+  module        Module           @relation(fields: [moduleId], references: [id])
+  term          String
+  date          String // YYYY-MM-DD
+  startMin      Int
+  endMin        Int
+  status        String           @default("PLANNED") // PLANNED | VENUES_ALLOCATED | SEATED | READY | COMPLETED
+  cohorts       ExamCohort[]
+  venues        ExamVenue[]
+  seats         SeatAllocation[]
+  invigilations Invigilation[]
+
+  @@index([date, startMin])
+}
+
+model ExamCohort {
+  id       String      @id @default(cuid())
+  examId   String
+  exam     ExamSession @relation(fields: [examId], references: [id], onDelete: Cascade)
+  cohortId String
+  cohort   Cohort      @relation(fields: [cohortId], references: [id])
+
+  @@unique([examId, cohortId])
+}
+
+model ExamVenue {
+  id     String      @id @default(cuid())
+  examId String
+  exam   ExamSession @relation(fields: [examId], references: [id], onDelete: Cascade)
+  roomId String
+  room   Room        @relation(fields: [roomId], references: [id])
+
+  @@unique([examId, roomId])
+}
+
+model SeatAllocation {
+  id        String      @id @default(cuid())
+  examId    String
+  exam      ExamSession @relation(fields: [examId], references: [id], onDelete: Cascade)
+  roomId    String
+  room      Room        @relation(fields: [roomId], references: [id])
+  studentId String
+  student   Student     @relation(fields: [studentId], references: [id])
+  seatNo    Int
+  row       Int
+  col       Int
+  label     String // e.g. B4
+
+  @@unique([examId, studentId])
+  @@index([roomId, examId])
+}
+
+model Invigilation {
+  id         String      @id @default(cuid())
+  examId     String
+  exam       ExamSession @relation(fields: [examId], references: [id], onDelete: Cascade)
+  roomId     String
+  room       Room        @relation(fields: [roomId], references: [id])
+  lecturerId String
+  lecturer   Lecturer    @relation(fields: [lecturerId], references: [id])
+  role       String // CHIEF | ASSISTANT
+
+  @@unique([examId, roomId, lecturerId])
+}
